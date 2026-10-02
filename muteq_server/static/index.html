@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MUTEq Dashboard</title>
+  <link rel="stylesheet" href="/static/dashboard.css?v=5" />
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+
+  <!-- Toolbar -->
+  <header id="toolbar">
+    <div id="toolbar-left">
+      <span class="app-title">MUTEq</span>
+      <span id="device-name" class="meta-text"></span>
+      <span id="location" class="meta-text"></span>
+      <span id="env-profile" class="meta-text"></span>
+    </div>
+    <div id="toolbar-right">
+      <span id="status-pill" class="pill pill--loading">Connecting&hellip;</span>
+      <span id="last-updated" class="meta-text"></span>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- KPI cards (default window = 1h) -->
+    <div class="kpi-row">
+      <div class="card">
+        <div class="card-label">Latest SPL</div>
+        <div class="card-value" id="kpi-latest">&mdash;</div>
+        <div class="card-unit">dB</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Peak (window)</div>
+        <div class="card-value" id="kpi-peak">&mdash;</div>
+        <div class="card-unit">dB</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Events (&ge;70 dB)</div>
+        <div class="card-value" id="kpi-events">&mdash;</div>
+        <div class="card-unit">in window</div>
+      </div>
+      <div class="card">
+        <div class="card-label">p90</div>
+        <div class="card-value" id="kpi-p90">&mdash;</div>
+        <div class="card-unit">dB</div>
+      </div>
+    </div>
+
+    <!-- Main SPL chart -->
+    <div class="panel chart-panel">
+      <div class="panel-header">
+        <h2 id="chart-title">SPL</h2>
+        <button id="live-btn" class="tf-btn">Live</button>
+      </div>
+      <div id="chart-container">
+        <div id="spl-tooltip" class="hidden"></div>
+      </div>
+      <div id="loading-overlay" class="hidden">
+        <div class="spinner"></div>
+        <span>Loading&hellip;</span>
+      </div>
+      <div id="empty-state" class="hidden">No data for this time window.</div>
+    </div>
+
+    <!-- Secondary charts: histogram + heatmap -->
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-header"><h2>Noise Distribution</h2></div>
+        <div id="histogram-chart" class="bar-chart"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-header"><h2>Events by Hour (7d)</h2></div>
+        <div id="heatmap-chart" class="bar-chart"></div>
+      </div>
+    </div>
+
+    <!-- Daily stats table -->
+    <div class="panel">
+      <div class="panel-header"><h2>Daily Statistics (last 30 days)</h2></div>
+      <table>
+        <thead>
+          <tr><th>Date</th><th>Avg (dB)</th><th>Peak (dB)</th><th>Events (&ge;70 dB)</th></tr>
+        </thead>
+        <tbody id="daily-tbody">
+          <tr><td colspan="4">Loading&hellip;</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Threshold events table -->
+    <div class="panel">
+      <div class="panel-header">
+        <h2>Threshold Events &mdash; last 24h</h2>
+      </div>
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Noise (dB)</th><th>Peak (dB)</th></tr>
+        </thead>
+        <tbody id="events-tbody">
+          <tr><td colspan="3">Loading&hellip;</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </main>
+
+  <script src="/static/dashboard.js?v=5"></script>
+</body>
+</html>

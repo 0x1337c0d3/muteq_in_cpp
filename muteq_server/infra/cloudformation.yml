@@ -1,0 +1,271 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  MUTEq dashboard - EC2 FastAPI server, nginx HTTPS (Let's Encrypt via Route53 DNS-01),
+  Elastic IP, Route53 A record. Deploy in us-east-1.
+
+# -- Parameters ----------------------------------------------------------------
+Parameters:
+
+  DomainName:
+    Type: String
+    Default: www.hoongram.com
+    Description: Public hostname for the dashboard (must be in the Route53 hosted zone)
+
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Route53 hosted zone ID for hoongram.com (must already exist)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair name for SSH access
+
+  HmacSecret:
+    Type: String
+    NoEcho: true
+    Description: >
+      Shared HMAC-SHA256 secret - must match server_hmac_secret in sensor/client_config.json.
+      Generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
+
+  AcmeEmail:
+    Type: String
+    Description: Email address for Let's Encrypt certificate expiry notifications
+
+  GitRepoUrl:
+    Type: String
+    Default: ''
+    Description: >
+      Git repository URL to clone on first boot (e.g. https://github.com/you/mute.git).
+      Leave empty to deploy code manually via SSH after the stack is up.
+
+  InstanceType:
+    Type: String
+    Default: t4g.micro
+    AllowedValues: [t4g.nano, t4g.micro, t4g.small]
+    Description: EC2 instance type (t4g = Graviton ARM64)
+
+  # Resolves to the latest Amazon Linux 2023 ARM64 AMI in us-east-1 at deploy time.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+
+# -- Resources ----------------------------------------------------------------─
+Resources:
+
+  # -- IAM ----------------------------------------------------------------------
+  DashboardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: muteq-dashboard-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Allows SSM Session Manager access (SSH alternative, no key needed)
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: Route53CertbotAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - route53:GetChange
+                  - route53:ChangeResourceRecordSets
+                  - route53:ListHostedZones
+                  - route53:ListHostedZonesByName
+                Resource: '*'
+
+  DashboardInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: muteq-dashboard-profile
+      Roles: [!Ref DashboardRole]
+
+  # -- Security Group ------------------------------------------------------------
+  DashboardSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MUTEq dashboard - HTTP, HTTPS, SSH
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 22,  ToPort: 22,  CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 80,  ToPort: 80,  CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+      Tags:
+        - {Key: Name, Value: muteq-dashboard}
+
+  # -- Elastic IP ----------------------------------------------------------------
+  DashboardEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: muteq-dashboard}
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt DashboardEIP.AllocationId
+      InstanceId: !Ref DashboardInstance
+
+  # -- EC2 Instance --------------------------------------------------------------
+  DashboardInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref DashboardInstanceProfile
+      SecurityGroupIds: [!GetAtt DashboardSecurityGroup.GroupId]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/muteq-setup.log) 2>&1
+
+          # -- System packages --------------------------------------------------
+          dnf update -y
+          dnf install -y git nginx python3-pip sqlite cronie
+          systemctl enable --now crond
+
+          # -- uv --------------------------------------------------------------─
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          ln -sf /root/.local/bin/uv /usr/local/bin/uv
+
+          # -- App and data directories ----------------------------------------─
+          mkdir -p /opt/muteq /var/lib/muteq-dashboard
+
+          # -- Clone repo (if URL provided) ------------------------------------─
+          if [ -n "${GitRepoUrl}" ]; then
+            git clone "${GitRepoUrl}" /opt/muteq/app
+            cd /opt/muteq/app && /usr/local/bin/uv sync
+          fi
+
+          # -- Environment file (600 perms - contains HMAC secret) --------------─
+          cat > /etc/muteq-dashboard.env << 'ENVEOF'
+          MUTEQ_PORT=8080
+          MUTEQ_HOST=127.0.0.1
+          MUTEQ_DB=/var/lib/muteq-dashboard/muteq.db
+          MUTEQ_STATIC_DIR=/opt/muteq_server/static
+          MUTEQ_HMAC_SECRET=${HmacSecret}
+          ENVEOF
+          chmod 600 /etc/muteq-dashboard.env
+
+          # -- systemd service --------------------------------------------------─
+          cat > /etc/systemd/system/muteq-dashboard.service << 'SVCEOF'
+          [Unit]
+          Description=MUTEq C++23 Dashboard Server
+          After=network.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/muteq_server
+          EnvironmentFile=/etc/muteq-dashboard.env
+          ExecStart=/opt/muteq_server/bin/muteq_server
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          systemctl daemon-reload
+          systemctl enable muteq-dashboard
+
+          # -- Let's Encrypt (DNS-01 challenge via Route53) ----------------------
+          pip3 install certbot certbot-dns-route53
+          certbot certonly \
+            --dns-route53 \
+            --non-interactive \
+            --agree-tos \
+            --email "${AcmeEmail}" \
+            -d "${DomainName}"
+
+          # -- nginx ------------------------------------------------------------─
+          rm -f /etc/nginx/conf.d/default.conf
+          cat > /etc/nginx/conf.d/muteq.conf << NGINXEOF
+          server {
+              listen 80;
+              server_name ${DomainName};
+              return 301 https://\$host\$request_uri;
+          }
+          server {
+              listen 443 ssl;
+              server_name ${DomainName};
+              ssl_certificate     /etc/letsencrypt/live/${DomainName}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/${DomainName}/privkey.pem;
+              location / {
+                  proxy_pass http://127.0.0.1:8080;
+                  proxy_set_header Host              \$host;
+                  proxy_set_header X-Real-IP         \$remote_addr;
+                  proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto https;
+              }
+              location /music/ {
+                  proxy_pass http://127.0.0.1:3000/;
+                  proxy_set_header Host              \$host;
+                  proxy_set_header X-Real-IP         \$remote_addr;
+                  proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto https;
+              }
+          }
+          NGINXEOF
+
+          nginx -t
+          systemctl enable --now nginx
+
+          # -- Certbot auto-renew cron ------------------------------------------─
+          echo "0 3 * * * root /usr/local/bin/certbot renew --quiet && /usr/bin/systemctl reload nginx" \
+            > /etc/cron.d/certbot-renew
+
+          # -- Start app (if repo was cloned) ------------------------------------
+          if [ -n "${GitRepoUrl}" ]; then
+            systemctl start muteq-dashboard
+          fi
+
+      Tags:
+        - {Key: Name, Value: muteq-dashboard}
+
+  # -- Route53 A record ----------------------------------------------------------
+  # DependsOn EIPAssociation ensures the IP is bound before DNS is updated.
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn: EIPAssociation
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${DomainName}.'
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !Ref DashboardEIP
+
+# -- Outputs ------------------------------------------------------------------─
+Outputs:
+
+  DashboardURL:
+    Description: Public dashboard URL
+    Value: !Sub 'https://${DomainName}'
+
+  InstanceId:
+    Description: EC2 instance ID (use with SSM Session Manager or SSH)
+    Value: !Ref DashboardInstance
+
+  ElasticIP:
+    Description: Static IP address of the dashboard server
+    Value: !Ref DashboardEIP
+
+  SSHCommand:
+    Description: SSH command (after stack creation)
+    Value: !Sub 'ssh ec2-user@${DashboardEIP}'
+
+  SetupLog:
+    Description: Check first-boot setup progress
+    Value: 'sudo tail -f /var/log/muteq-setup.log'

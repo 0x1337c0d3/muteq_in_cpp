@@ -1,0 +1,9 @@
+.git
+Build
+build
+.build
+DerivedData
+bin
+*.dSYM
+*.db*
+*.o
