@@ -30,6 +30,9 @@ void serial_worker(std::stop_token stop, SplMeterReader& reader, AsymmetricEMA& 
 void consumer_worker(std::stop_token stop, SplDatabase& db, HttpEgressClient& http, const EgressConfig& egress_cfg);
 
 int main(int argc, char* argv[]) {
+    // Ensure line-buffered stdout so systemd journal captures logs immediately
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     // 1. Install signal handlers for graceful shutdown (SIGINT / SIGTERM)
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
