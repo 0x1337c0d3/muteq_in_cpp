@@ -68,6 +68,11 @@ int main(int argc, char* argv[]) {
         std::println(" Press [Ctrl+C] to cleanly exit.");
         std::println("=============================================");
 
+        // Startup maintenance: purge expired historical records and truncate WAL
+        std::println("Performing startup database maintenance...");
+        db.prune_old_data(3, 14);
+        db.checkpoint();
+
         std::jthread serial_thread([&](std::stop_token stop) {
             while (!stop.stop_requested()) {
                 serial_worker(stop, reader, ema, app_cfg.threshold_dba);
@@ -114,15 +119,20 @@ void serial_worker(std::stop_token stop, SplMeterReader& reader, AsymmetricEMA& 
 
     if (window_peak > 0.0f) {
         const float smoothed = ema.update(window_peak);
-        const auto now =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-                .count();
-
-        std::println("[{}] Peak: {:.1f} dBA | Smoothed: {:.1f} dBA", now, window_peak, smoothed);
-
         buffer_readings.put(smoothed);
 
+        static auto last_heartbeat = std::chrono::steady_clock::now();
+        const auto now_steady = std::chrono::steady_clock::now();
+        if (now_steady - last_heartbeat >= std::chrono::seconds(30)) {
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+            std::println("[{}] [Heartbeat] Peak: {:.1f} dBA | Smoothed: {:.1f} dBA", now_ms, window_peak, smoothed);
+            last_heartbeat = now_steady;
+        }
+
         if (window_peak >= threshold) {
+            std::println(" [THRESHOLD ALERT] Peak: {:.1f} dBA >= {:.1f} dBA", window_peak, threshold);
             buffer_events.put(window_peak);
         }
     }
@@ -148,9 +158,19 @@ void consumer_worker(std::stop_token stop, SplDatabase& db, HttpEgressClient& ht
                      db.count_unsent_events());
     }
 
-    // Flush to server immediately when high-noise events occur, or periodically when publish_interval elapses
-    static auto last_periodic_flush = std::chrono::steady_clock::now();
+    // Periodic maintenance: prune old sent data and checkpoint WAL every 1 hour
+    static auto last_prune_time = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
+    if (now - last_prune_time >= std::chrono::hours(1)) {
+        std::println(" [MAINTENANCE] Pruning expired telemetry records...");
+        db.prune_old_data(3, 14);
+        db.checkpoint();
+        last_prune_time = now;
+    }
+
+    // Flush to server immediately when high-noise events occur, or periodically when publish_interval elapses
+    // Initialize to force an immediate flush upon daemon start
+    static auto last_periodic_flush = std::chrono::steady_clock::now() - egress_cfg.publish_interval;
     const bool periodic_due = (now - last_periodic_flush) >= egress_cfg.publish_interval;
 
     if ((has_new_events || periodic_due) && !egress_cfg.server_url.empty()) {
@@ -158,10 +178,14 @@ void consumer_worker(std::stop_token stop, SplDatabase& db, HttpEgressClient& ht
         if (result.readings_sent > 0 || result.events_sent > 0) {
             std::println(" [HTTP EGRESS] Flushed {} readings and {} events to {}", result.readings_sent,
                          result.events_sent, egress_cfg.server_url);
+            last_periodic_flush = now;
         } else if (!result.success && !result.error_message.empty()) {
             std::println(std::cerr, " [HTTP EGRESS ERROR] {}", result.error_message);
+            // On failure, retry in 30 seconds rather than waiting full interval
+            last_periodic_flush = now - egress_cfg.publish_interval + std::chrono::seconds(30);
+        } else {
+            last_periodic_flush = now;
         }
-        last_periodic_flush = now;
     }
 
     if (!has_work && !stop.stop_requested()) {

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <fcntl.h>
 #include <optional>
@@ -37,18 +38,50 @@ class SplMeterReader {
     static constexpr float SPL_MIN = 30.0f;
     static constexpr float SPL_MAX = 130.0f;
 
-    explicit SplMeterReader(std::string_view port_name) {
-        const std::string port_str(port_name);
-        fd_ = ::open(port_str.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    explicit SplMeterReader(std::string_view port_name) : port_path_(port_name) {
+        if (!open_port()) {
+            throw std::system_error(errno != 0 ? errno : EIO, std::generic_category(),
+                                    "Failed to open serial port " + port_path_);
+        }
+    }
+
+    ~SplMeterReader() {
+        close_port();
+    }
+
+    // Disable copies, allow moves
+    SplMeterReader(const SplMeterReader&) = delete;
+    SplMeterReader& operator=(const SplMeterReader&) = delete;
+
+    SplMeterReader(SplMeterReader&& other) noexcept
+        : port_path_(std::move(other.port_path_)), fd_(std::exchange(other.fd_, -1)),
+          rx_buf_(std::move(other.rx_buf_)),
+          last_reconnect_attempt_(other.last_reconnect_attempt_) {
+    }
+
+    SplMeterReader& operator=(SplMeterReader&& other) noexcept {
+        if (this != &other) {
+            close_port();
+            port_path_ = std::move(other.port_path_);
+            fd_ = std::exchange(other.fd_, -1);
+            rx_buf_ = std::move(other.rx_buf_);
+            last_reconnect_attempt_ = other.last_reconnect_attempt_;
+        }
+        return *this;
+    }
+
+    bool open_port() noexcept {
+        close_port();
+        fd_ = ::open(port_path_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
         if (fd_ < 0) {
-            throw std::system_error(errno, std::generic_category(), "Failed to open serial port " + port_str);
+            return false;
         }
 
         // Configure 115200 8N1 raw mode
         termios tty{};
         if (::tcgetattr(fd_, &tty) != 0) {
-            ::close(fd_);
-            throw std::system_error(errno, std::generic_category(), "Failed to get termios attr");
+            close_port();
+            return false;
         }
 
         ::cfsetspeed(&tty, B115200);
@@ -63,31 +96,18 @@ class SplMeterReader {
         tty.c_cc[VMIN] = 0;
 
         ::tcflush(fd_, TCIFLUSH);
-        ::tcsetattr(fd_, TCSANOW, &tty);
+        if (::tcsetattr(fd_, TCSANOW, &tty) != 0) {
+            close_port();
+            return false;
+        }
+        return true;
     }
 
-    ~SplMeterReader() {
+    void close_port() noexcept {
         if (fd_ >= 0) {
             ::close(fd_);
+            fd_ = -1;
         }
-    }
-
-    // Disable copies, allow moves
-    SplMeterReader(const SplMeterReader&) = delete;
-    SplMeterReader& operator=(const SplMeterReader&) = delete;
-
-    SplMeterReader(SplMeterReader&& other) noexcept
-        : fd_(std::exchange(other.fd_, -1)), rx_buf_(std::move(other.rx_buf_)) {
-    }
-
-    SplMeterReader& operator=(SplMeterReader&& other) noexcept {
-        if (this != &other) {
-            if (fd_ >= 0)
-                ::close(fd_);
-            fd_ = std::exchange(other.fd_, -1);
-            rx_buf_ = std::move(other.rx_buf_);
-        }
-        return *this;
     }
 
     /// Decode canonical 6-byte CH340 framed packet:
@@ -112,14 +132,31 @@ class SplMeterReader {
         return SplReading{.db_a = db, .raw_high = high, .raw_low = low};
     }
 
-    /// Read next valid sample from the serial descriptor, with automatic stream re-sync.
+    /// Read next valid sample from the serial descriptor, with automatic stream re-sync and auto-reconnect.
     std::optional<SplReading> read_next_sample() noexcept {
+        if (fd_ < 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_reconnect_attempt_ < std::chrono::seconds(2)) {
+                return std::nullopt;
+            }
+            last_reconnect_attempt_ = now;
+            if (!open_port()) {
+                return std::nullopt;
+            }
+        }
+
         uint8_t buffer[64];
         ssize_t n = ::read(fd_, buffer, sizeof(buffer));
         if (n > 0) {
             rx_buf_.insert(rx_buf_.end(), buffer, buffer + n);
-        } else if (n < 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) {
-            return std::nullopt; // Error on descriptor
+        } else if (n < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                // Device disconnected or I/O error; reset descriptor and attempt reconnect later
+                close_port();
+                rx_buf_.clear();
+                last_reconnect_attempt_ = std::chrono::steady_clock::now();
+                return std::nullopt;
+            }
         }
 
         // Search for 6-byte packet: 0x55 hi lo 0x01 0x01 0xAA
@@ -151,8 +188,10 @@ class SplMeterReader {
     }
 
   private:
+    std::string port_path_;
     int fd_{-1};
     std::vector<uint8_t> rx_buf_;
+    std::chrono::steady_clock::time_point last_reconnect_attempt_{};
 };
 
 } // namespace muteq

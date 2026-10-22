@@ -98,7 +98,7 @@ struct EgressConfig {
     std::string server_hmac_secret; /// Secret key matching MUTEQ_HMAC_SECRET
     std::string device_id;          /// Unique device identifier
     bool ssl_verify{true};          /// Verify SSL peer certificates
-    std::chrono::seconds timeout{10};
+    std::chrono::seconds timeout{30};
     size_t batch_readings_limit{5000};
     size_t batch_events_limit{2000};
     size_t max_catchup_loops{10};
@@ -153,9 +153,12 @@ class HttpEgressClient {
         }
 
         if (!curl_) {
-            total_result.success = false;
-            total_result.error_message = "CURL handle not initialized";
-            return total_result;
+            curl_ = ::curl_easy_init();
+            if (!curl_) {
+                total_result.success = false;
+                total_result.error_message = "CURL handle not initialized";
+                return total_result;
+            }
         }
 
         std::string ingest_url = config.server_url;
@@ -207,6 +210,7 @@ class HttpEgressClient {
                 } else {
                     total_result.error_message = ::curl_easy_strerror(res);
                 }
+                ::curl_easy_reset(curl_);
                 break;
             }
 
@@ -233,6 +237,7 @@ class HttpEgressClient {
             } else {
                 total_result.success = false;
                 total_result.error_message = std::format("Server returned HTTP {}", http_code);
+                ::curl_easy_reset(curl_);
                 break; // Stop and retry next interval on error
             }
         }

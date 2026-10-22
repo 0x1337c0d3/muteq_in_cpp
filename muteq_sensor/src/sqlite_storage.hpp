@@ -514,12 +514,20 @@ class SqliteStorage {
         return db_;
     }
 
+    /// Truncate WAL file back to 0 bytes and reset journal frames
+    void wal_checkpoint_truncate() noexcept {
+        if (db_) {
+            ::sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+        }
+    }
+
   private:
     void init_engine() {
         // WAL journal mode and normal sync for SD card endurance
         exec("PRAGMA journal_mode = WAL;");
         exec("PRAGMA synchronous = NORMAL;");
         exec("PRAGMA busy_timeout = 5000;");
+        exec("PRAGMA wal_autocheckpoint = 1000;");
 
         // Readings & events schema (mirrors mute/sensor/app/db.py)
         exec("CREATE TABLE IF NOT EXISTS readings ("

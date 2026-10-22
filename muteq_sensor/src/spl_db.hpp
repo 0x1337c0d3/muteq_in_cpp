@@ -366,6 +366,13 @@ class SplDatabase {
         const std::string cutoff_unsent = to_iso8601(now - std::chrono::days(unsent_retain_days));
 
         storage_.prune_old_data(cutoff_sent, cutoff_unsent);
+        storage_.wal_checkpoint_truncate();
+    }
+
+    /// Truncate WAL file back to 0 bytes
+    void checkpoint() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        storage_.wal_checkpoint_truncate();
     }
 
     /// Access underlying SqliteStorage if direct low-level API is required
