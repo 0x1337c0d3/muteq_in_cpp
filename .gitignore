@@ -100,6 +100,5 @@ CMakeCache.txt
 *.db-wal
 *.db-shm
 
-muteq_sensor/install.sh
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,xcode,c++
